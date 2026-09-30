@@ -1,9 +1,12 @@
 [package]
 name = "audit_trail"
 version = "0.1.0"
-description = "A Rust library for Audit_trail"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/casey-digennaro/audit_trail"
 edition = "2021"
+description = "Append-only audit trail with a hash-chained head, in the shape the SuperInstance witness log needs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/SuperInstance/audit-trail"
+readme = "README.md"
+keywords = ["audit", "audit-log", "append-only", "hash-chain", "provenance"]
+categories = ["algorithms", "data-structures"]
 
 [dependencies]

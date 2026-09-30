@@ -1,87 +1,117 @@
-# Audit Trail
+# audit-trail
 
-**Audit Trail** is a Rust library implementing immutable, append-only event logging for the SuperInstance fleet, providing cryptographic chain-of-custody tracking for every agent action, decision, and state transition.
-
-## Why It Matters
-
-In multi-agent systems where autonomous agents make consequential decisions, auditability is not optional — it is a safety requirement. An immutable audit trail enables post-hoc forensics: when an agent takes an unexpected action, the trail shows the full chain of inputs, inferences, and decisions that led to it. This is essential for debugging emergent misbehavior, complying with AI governance frameworks (EU AI Act, NIST AI RMF), and building trust with human operators. Unlike regular logging, an audit trail is tamper-evident: each entry chains to the previous via a hash, making retroactive modification detectable. This property is borrowed from blockchain design but applied to the simpler problem of single-writer audit logging.
-
-## How It Works
-
-**Append-only log structure:**
-Each audit entry contains:
-
-```
-Entry {
-    timestamp: u64,
-    agent_id: String,
-    action: String,
-    inputs: Vec<String>,
-    outputs: Vec<String>,
-    prev_hash: [u8; 32],
-    entry_hash: [u8; 32],
-}
-```
-
-The `entry_hash` is computed as `SHA-256(timestamp || agent_id || action || inputs || outputs || prev_hash)`. This creates a hash chain: modifying any historical entry invalidates all subsequent hashes.
-
-**Verification:** To verify integrity, recompute every hash from genesis to the latest entry in O(n) time. Any mismatch indicates tampering at that position.
-
-**Performance characteristics:**
-- Append: O(1) (single hash computation + write)
-- Verify full chain: O(n) where n = total entries
-- Search by agent: O(n) scan, or O(log n) with an indexed lookup
-- Storage: ~200 bytes per entry (typical)
-
-**Comparison with alternatives:**
-
-| Approach | Tamper Detection | Append Cost | Verify Cost |
-|----------|-----------------|-------------|-------------|
-| Plain log file | None | O(1) | N/A |
-| Signed log entries | Per-entry | O(1) + sig | O(n) + verify |
-| Hash chain (this) | Full chain | O(1) + hash | O(n) |
-| Merkle tree | Root-level | O(log n) | O(log n) |
-
-The hash-chain approach offers the best trade-off: minimal append overhead (single SHA-256) with full-chain integrity verification.
-
-## Quick Start
+An append-only audit log where **each event commits to its predecessor**, in the shape the
+SuperInstance witness log needs.
 
 ```rust
-fn main() {
-    println!("Audit trail initialized.");
-    // In production:
-    // 1. Create trail with genesis entry
-    // 2. Append each agent action with context
-    // 3. Periodically verify chain integrity
-    // 4. Export for forensic analysis
-}
+use audit_trail::{AuditAction, AuditTrail};
+
+let mut t = AuditTrail::new();
+t.record("alice", AuditAction::Login, "cell/1", "ok");
+t.record("bob",   AuditAction::Update, "cell/1", "tick=4");
+
+assert!(t.intact());
 ```
 
-## API
+## What this replaces
 
-| Component | Description |
-|-----------|-------------|
-| Audit entry | Timestamp, agent, action, I/O, hash chain |
-| Append | O(1) append with automatic chaining |
-| Verify | O(n) full chain integrity check |
-| Search | Filter by agent, time range, or action type |
+The first version of this crate was `Vec<AuditEvent>` with sequential ids. That is an
+append-only list in the sense nothing removes from it, and it is nothing else — there is no
+hash, so there is nothing to alter and therefore nothing to detect. The README at the time
+described an "immutable, append-only event logging" architecture that the code did not have.
 
-## Architecture Notes
+This version has the one property that makes an audit log worth keeping:
 
-The Audit Trail provides the **accountability layer** for γ + η = C conservation. Every conservation-law observation, avoidance-ratio measurement, and species-survival determination is logged with cryptographic chain-of-custody. This ensures that conservation claims can be independently verified — if the trail shows that avoidance ratio was conserved at σ = 0.001, a reviewer can confirm no entries were retroactively altered.
+```
+hash(N) = FNV-1a-64( canonical(N) ‖ hash(N-1) )
+```
 
-See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+Editing any historical event invalidates the hash of every event after it, and `verify`
+reports the id of the first break.
 
-**Merkle tree alternative:** For scenarios requiring efficient partial verification (verify a single entry without scanning the entire chain), a Merkle tree is preferred. Each leaf is an entry hash; internal nodes hash their children. Verifying entry i requires only O(log n) hashes (the Merkle proof path). However, Merkle trees have higher append complexity (O(log n) to recompute root) and more complex implementation. The hash-chain approach is optimal when full-chain verification is acceptable.
+## The fleet canary
 
-**Performance under load:** For a fleet generating 1000 audit events/second, the hash-chain approach adds ~0.5 μs per event (single SHA-256 on ~200 bytes). Total audit overhead: < 1ms/second of CPU time. Storage at this rate: ~17 GB/year uncompressed, ~3 GB with gzip compression.
+The hash is FNV-1a 64 because it is the digest the rest of the fleet already agrees on, so
+a chain written here compares byte-for-byte with one written in any other substrate.
 
-## References
+```
+$ cargo run
+fnv1a64("café Δ 日本語") = 0x24a555471370b18d
+fleet canary           = 0x24a555471370b18d
+agrees                 = true
+```
 
-1. Merkle, R.C. (1979). "A Certified Digital Signature." *CRYPTO*. (Hash chain foundation.)
-2. Nakamoto, S. (2008). "Bitcoin: A Peer-to-Peer Electronic Cash System." (Practical hash-chain application.)
-3. NIST (2023). *AI Risk Management Framework (AI RMF 1.0)*. Section 4: Measure.
+Verified in Python, TypeScript, Rust, C#, and Julia. `canary_holds()` re-checks it at
+runtime, so a port that drifts is caught by its own test suite.
 
-## License
+**FNV-1a is not a security primitive.** It is not collision resistant, and this is not a
+defence against an adversary who can choose their inputs. It is an integrity signal — the
+right one for a log whose purpose is accidental corruption plus casual tampering. If you
+need to resist a motivated adversary, read the section below and then the rest of this file.
 
-MIT
+## What a chain does NOT give you
+
+This is the part that is usually wrong, so it is stated first and prominently.
+
+A chain proves **relative order** and detects alteration of a **retained prefix**. It does
+not prove:
+
+- **that the writer did not rewrite the whole chain.** If an adversary holds the current
+  database and nobody kept an old head, a complete rewrite is undetectable. Anchor the head
+  externally — timestamp authority, immutable storage, a transparency log.
+- **that an event happened when its timestamp says.** `timestamp` is the host clock, which
+  is exactly as trustworthy as the host.
+- **that the recorded event is true about the world.** It is a faithful record of what was
+  recorded, which is a much narrower claim.
+
+Cryptographic integrity proves *none* of: that a prediction preceded the event, that the
+measurement was truthful, that the model was implemented correctly, or that the model is
+statistically valid. Four separate assumptions.
+
+## Design notes
+
+**Canonical encoding is injective.** String fields are length-prefixed, so `("ab","c")` and
+`("a","bc")` cannot produce the same bytes and therefore cannot hash the same. A hash over
+a serialisation whose order can vary is a hash over a coin flip.
+
+**Non-zero genesis.** `GENESIS = 0x9e3779b97f4a7c15`. A zero genesis is indistinguishable
+from a chain truncated back to nothing, which is exactly the attack you want to catch.
+
+**`events_mut` exists on purpose.** A log you cannot deserialise is not a log. Everything
+that mutates through it is *expected* to leave the chain broken — that is what `verify` is
+for. Live code should use `record`. `reseat()` rebuilds `next_id` after loading.
+
+**Injectable clock.** `with_clock` exists so the tests are deterministic; timestamps are
+otherwise host wall-clock seconds.
+
+## Tests
+
+```
+cargo test
+```
+
+14 tests. The five that matter are the negative controls — injecting a field, deleting an
+event, reordering, retimestamping, and verifying twice. **A suite that only asserted
+"record works" would pass on the original `Vec` implementation**, which is the thing this
+crate was rewritten to stop being.
+
+## What should be built next
+
+This is the smallest honest version. In order of value:
+
+1. **Batch the chain.** Merkle tree over events within a batch, hash-chain the *roots*.
+   Chaining every event is O(n) hashes for a log that is only ever checked at checkpoints;
+   the batched form is what the fleet's design calls for. See
+   [`SuperInstance/witness-validation`](https://github.com/SuperInstance/witness-validation)
+   for the full design and why consistency proofs matter.
+2. **Serialise.** A canonical, versioned encoding on disk, so a log survives the process
+   that wrote it.
+3. **Signed checkpoints.** Sign the head, publish it somewhere the writer does not control.
+   Without this, the chain detects accidents and nothing else.
+4. **A model version field.** A model change must be a new segment with an explicit version
+   bump, never a retroactive rewrite — that is the rule that keeps an error budget intact,
+   and it is the one a self-updating log violates first.
+
+## Licence
+
+MIT OR Apache-2.0, at your option.
